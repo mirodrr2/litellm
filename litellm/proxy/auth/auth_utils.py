@@ -3,7 +3,7 @@ import sys
 import traceback
 from typing import Any, List, Optional, Tuple
 
-from fastapi import HTTPException, Request, status
+from fastapi import HTTPException, Request, status, WebSocket, WebSocketDisconnect
 
 from litellm import Router, provider_list
 from litellm._logging import verbose_proxy_logger
@@ -12,6 +12,21 @@ from litellm.types.router import (
     CONFIGURABLE_CLIENTSIDE_AUTH_PARAMS,
     ConfigurableClientsideParamsCustomAuth,
 )
+
+
+def _get_request_ip_address_websocket(
+    websocket: WebSocket, use_x_forwarded_for: Optional[bool] = False
+) -> Optional[str]:
+
+    client_ip = None
+    if use_x_forwarded_for is True and "x-forwarded-for" in websocket.headers:
+        client_ip = websocket.headers["x-forwarded-for"]
+    elif websocket.client is not None:
+        client_ip = websocket.client.host
+    else:
+        client_ip = ""
+
+    return client_ip
 
 
 def _get_request_ip_address(
@@ -43,6 +58,29 @@ def _check_valid_ip(
     # if general_settings.get("use_x_forwarded_for") is True then use x-forwarded-for
     client_ip = _get_request_ip_address(
         request=request, use_x_forwarded_for=use_x_forwarded_for
+    )
+
+    # Check if IP address is allowed
+    if client_ip not in allowed_ips:
+        return False, client_ip
+
+    return True, client_ip
+
+
+def _check_valid_ip_websocket(
+    allowed_ips: Optional[List[str]],
+    websocket: WebSocket,
+    use_x_forwarded_for: Optional[bool] = False,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Returns if ip is allowed or not
+    """
+    if allowed_ips is None:  # if not set, assume true
+        return True, None
+
+    # if general_settings.get("use_x_forwarded_for") is True then use x-forwarded-for
+    client_ip = _get_request_ip_address_websocket(
+        websocket=websocket, use_x_forwarded_for=use_x_forwarded_for
     )
 
     # Check if IP address is allowed
@@ -182,6 +220,51 @@ def is_request_body_safe(
     return True
 
 
+async def pre_db_read_auth_checks_websocket(websocket: WebSocket, route: str):
+    """
+    1. Check if IP address is allowed (if set)
+    2. Check if request route is an allowed route on the proxy (if set)
+    """
+    from litellm.proxy.proxy_server import general_settings, llm_router, premium_user
+
+    # Helper function to close websocket with error
+    async def close_with_error(websocket: WebSocket, code: int, message: str):
+        if not websocket.client_state.value.startswith("DISCONNECTED"):
+            await websocket.close(code=code, reason=message)
+        raise WebSocketDisconnect(code=code, reason=message)
+
+    # Check 1. Check if IP address is allowed
+    is_valid_ip, passed_in_ip = _check_valid_ip_websocket(
+        allowed_ips=general_settings.get("allowed_ips", None),
+        use_x_forwarded_for=general_settings.get("use_x_forwarded_for", False),
+        websocket=websocket,
+    )
+
+    if not is_valid_ip:
+        await close_with_error(
+            websocket,
+            code=status.WS_1008_POLICY_VIOLATION,
+            message=f"Access forbidden: IP address {passed_in_ip} not allowed.",
+        )
+
+    # Check 2. Check if request route is an allowed route on the proxy
+    if "allowed_routes" in general_settings:
+        _allowed_routes = general_settings["allowed_routes"]
+        if premium_user is not True:
+            verbose_proxy_logger.error(
+                f"Trying to set allowed_routes. This is an Enterprise feature. {CommonProxyErrors.not_premium_user.value}"
+            )
+        if route not in _allowed_routes:
+            verbose_proxy_logger.error(
+                f"Route {route} not in allowed_routes={_allowed_routes}"
+            )
+            await close_with_error(
+                websocket,
+                code=status.WS_1008_POLICY_VIOLATION,
+                message=f"Access forbidden: Route {route} not allowed",
+            )
+
+
 async def pre_db_read_auth_checks(
     request: Request,
     request_data: dict,
@@ -305,6 +388,32 @@ def get_request_route(request: Request) -> str:
             f"error on get_request_route: {str(e)}, defaulting to request.url.path={request.url.path}"
         )
         return request.url.path
+
+
+def get_request_route_websocket(websocket: WebSocket) -> str:
+    """
+    Helper to get the route from the WebSocket connection
+
+    Remove base url from path if set e.g. `/genai/chat/completions` -> `/chat/completions`
+    """
+    try:
+        # Get the full URL path from the WebSocket
+        url_path = websocket.url.path
+
+        # Check if base_url is available and path starts with it
+        if hasattr(websocket, "base_url") and url_path.startswith(
+            websocket.base_url.path
+        ):
+            # Remove base_url from path
+            return url_path[len(websocket.base_url.path) - 1 :]
+        else:
+            return url_path
+
+    except Exception as e:
+        verbose_proxy_logger.debug(
+            f"error on get_request_route_websocket: {str(e)}, defaulting to websocket.url.path={websocket.url.path}"
+        )
+        return websocket.url.path
 
 
 async def check_if_request_size_is_safe(request: Request) -> bool:
